@@ -284,11 +284,11 @@ namespace VOL.Core.WorkFlow
 
         public static Sys_WorkFlowTable GetAuditFlowTable<T>(string workTableKey, string workFlowTableName = null)
         {
-            var table = DBServerProvider.DbContext.Set<Sys_WorkFlowTable>()
-                   .Where(x => x.WorkTable == (workFlowTableName ?? typeof(T).GetEntityTableName()) && x.WorkTableKey == workTableKey)
-                   // .Select(s => new { s.CurrentStepId,s.AuditStatus})
-                   .FirstOrDefault();
-            return table;
+            // Migrated to use XCode via SqlDapper instead of EF
+            var tableName = workFlowTableName ?? typeof(T).GetEntityTableName();
+            var sql = "SELECT * FROM Sys_WorkFlowTable WHERE WorkTable = @tableName AND WorkTableKey = @workTableKey";
+            var sqlDapper = DBServerProvider.SqlDapper;
+            return sqlDapper.QueryFirst<Sys_WorkFlowTable>(sql, new { tableName, workTableKey });
         }
 
         private static void Rewrite<T>(T entity, Sys_WorkFlow workFlow, bool changeTableStatus) where T : class
@@ -303,10 +303,22 @@ namespace VOL.Core.WorkFlow
 
             var dbContext = DBServerProvider.DbContext;
 
-
-            var workTable = dbContext.Set<Sys_WorkFlowTable>().Where(x => x.WorkTableKey == value && x.WorkFlow_Id == workFlow.WorkFlow_Id)
-                   .AsNoTracking()
-                  .Include(x => x.Sys_WorkFlowTableStep).ToList().FirstOrDefault();
+            // Migrated to use XCode via SqlDapper instead of EF
+            var sql = @"SELECT wt.*, wts.* FROM Sys_WorkFlowTable wt 
+                       LEFT JOIN Sys_WorkFlowTableStep wts ON wt.WorkFlowTable_Id = wts.WorkFlowTable_Id
+                       WHERE wt.WorkTableKey = @value AND wt.WorkFlow_Id = @workFlowId";
+            var sqlDapper = DBServerProvider.SqlDapper;
+            
+            var workTableDict = new Dictionary<Guid, Sys_WorkFlowTable>();
+            var workTables = sqlDapper.QueryList<Sys_WorkFlowTable>(sql, new { value, workFlowId = workFlow.WorkFlow_Id });
+            
+            // Load steps separately for simplicity
+            var workTable = workTables.FirstOrDefault();
+            if (workTable != null)
+            {
+                var stepsSql = "SELECT * FROM Sys_WorkFlowTableStep WHERE WorkFlowTable_Id = @tableId";
+                workTable.Sys_WorkFlowTableStep = sqlDapper.QueryList<Sys_WorkFlowTableStep>(stepsSql, new { tableId = workTable.WorkFlowTable_Id });
+            }
             if (workTable == null || workFlow.Sys_WorkFlowStep == null || workFlow.Sys_WorkFlowStep.Count == 0)
             {
                 Console.WriteLine($"未查到流程数据，id：{workFlow.WorkFlow_Id}");
@@ -330,14 +342,15 @@ namespace VOL.Core.WorkFlow
 
             if (changeTableStatus)
             {
-                dbContext.Entry(entity).State = EntityState.Detached;
-                autditProperty.SetValue(entity, 0);
-                dbContext.Entry(entity).Property(autditProperty.Name).IsModified = true;
+                // Migrated to use XCode - update entity status directly with SQL
+                var entitySql = $"UPDATE {typeof(T).GetEntityTableName()} SET {autditProperty.Name} = 0 WHERE {typeof(T).GetKeyName()} = @keyValue";
+                var entitySqlDapper = DBServerProvider.SqlDapper;
+                entitySqlDapper.ExcuteNonQuery(entitySql, new { keyValue = value });
             }
 
-            dbContext.Entry(workTable).State = EntityState.Detached;
-            dbContext.Update(workTable);
-            dbContext.SaveChanges();
+            // Migrated to use XCode - update WorkFlowTable and steps with SQL
+            WorkFlowXCodeService.UpdateWorkFlowTable(workTable);
+            WorkFlowXCodeService.UpdateWorkFlowTableSteps(workTable.Sys_WorkFlowTableStep);
 
         }
         /// <summary>
@@ -379,26 +392,29 @@ namespace VOL.Core.WorkFlow
             //提交的草稿直接删除
             if (checkId)
             {
-                var list = DBServerProvider.DbContext.Set<Sys_WorkFlowTable>()
-                     .Where(x => x.WorkTable == workTable && x.WorkTableKey == tableKey)
-                     .Include(c => c.Sys_WorkFlowTableStep)
-                     .AsNoTracking()
-                     .ToList();
+                // Migrated to use XCode for workflow table operations
+                var sql = "SELECT * FROM Sys_WorkFlowTable WHERE WorkTable = @workTable AND WorkTableKey = @tableKey";
+                var queryDapper = DBServerProvider.SqlDapper;
+                var list = queryDapper.QueryList<Sys_WorkFlowTable>(sql, new { workTable, tableKey });
+                
                 if (list.Count > 0)
                 {
-                    DBServerProvider.DbContext.Set<Sys_WorkFlowTable>().RemoveRange(list);
-                    DBServerProvider.DbContext.SaveChanges();
-                    logHis = DBServerProvider.DbContext.Set<Sys_WorkFlowTableAuditLog>()
-                        .Where(x => x.WorkFlowTable_Id == list[0].WorkFlowTable_Id)
-                        .ToList();
+                    // Load steps for each table
+                    foreach (var table in list)
+                    {
+                        var stepsSql = "SELECT * FROM Sys_WorkFlowTableStep WHERE WorkFlowTable_Id = @tableId";
+                        table.Sys_WorkFlowTableStep = queryDapper.QueryList<Sys_WorkFlowTableStep>(stepsSql, new { tableId = table.WorkFlowTable_Id });
+                    }
+                    
+                    WorkFlowXCodeService.RemoveWorkFlowTables(list);
+                    logHis = WorkFlowXCodeService.FindWorkFlowTableAuditLog(list[0].WorkFlowTable_Id);
                     foreach (var item in logHis)
                     {
                         item.Id = Guid.NewGuid();
                     }
                 }
-                auditStatus = (int)AuditStatus.待审核;
             }
-
+            auditStatus = (int)AuditStatus.待审核;
 
             auditProperty.SetValue(entity, auditStatus);
 
@@ -620,9 +636,10 @@ namespace VOL.Core.WorkFlow
 
             workFlowTable.Sys_WorkFlowTableStep = steps;
 
-            var entityContext = DBServerProvider.DbContext;
-            entityContext.Entry(entity).Property(auditProperty.Name).IsModified = true;
-            entityContext.SaveChanges();
+            // Migrated to use XCode - update entity audit status directly with SQL
+            var entitySql = $"UPDATE {typeof(T).GetEntityTableName()} SET {auditProperty.Name} = @auditStatus WHERE {typeof(T).GetKeyName()} = @keyValue";
+            var updateDapper = DBServerProvider.SqlDapper;
+            updateDapper.ExcuteNonQuery(entitySql, new { auditStatus, keyValue = tableKey });
 
             //写入日志
             var log = new Sys_WorkFlowTableAuditLog()
@@ -633,11 +650,12 @@ namespace VOL.Core.WorkFlow
                 AuditStatus = (int)AuditStatus.待审核,
                 Remark = $"[{userInfo.UserTrueName}]提交了数据"
             };
-            var dbContext = DBServerProvider.DbContext;
-            dbContext.Set<Sys_WorkFlowTable>().Add(workFlowTable);
+            
+            // Migrated to use XCode for WorkFlow operations
+            WorkFlowXCodeService.AddWorkFlowTable(workFlowTable);
             if (workFlow.DefaultAuditStatus != AuditStatus.草稿 && workFlow.DefaultAuditStatus != AuditStatus.待提交)
             {
-                dbContext.Set<Sys_WorkFlowTableAuditLog>().Add(log);
+                WorkFlowXCodeService.AddWorkFlowTableAuditLog(log);
             }
             //流程提交历史数据写入新的记录数据
             if (logHis != null)
@@ -645,11 +663,9 @@ namespace VOL.Core.WorkFlow
                 foreach (var item in logHis)
                 {
                     item.WorkFlowTable_Id = workFlowTable.WorkFlowTable_Id;
+                    WorkFlowXCodeService.AddWorkFlowTableAuditLog(item);
                 }
-                dbContext.Set<Sys_WorkFlowTableAuditLog>().AddRange(logHis);
             }
-            dbContext.SaveChanges();
-            dbContext.Set<Sys_WorkFlowTable>().Entry(workFlowTable).State = EntityState.Detached;
             if (addWorkFlowExecuted != null)
             {
                 var userIds = GetAuditUserIds(nodeInfo.StepType ?? 0, nodeInfo.StepValue);
@@ -660,7 +676,7 @@ namespace VOL.Core.WorkFlow
                 //发送邮件(appsettings.json配置文件里添加邮件信息)
                 var nextStep = workFlowTable.Sys_WorkFlowTableStep.Where(x => x.StepAttrType != StepType.start.ToString()).OrderBy(x => x.OrderId).FirstOrDefault(); ;
 
-                SendMail(workFlowTable, filterOption, nextStep, dbContext);
+                SendMail(workFlowTable, filterOption, nextStep, null);
             }
         }
 
